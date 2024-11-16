@@ -15,11 +15,11 @@ async function main() {
 
 	console.log("RaffleFactory deployed to:", raffleFactory.target);
 
-	// Verify contract on Taiko if needed (requires API keys)
-	await hre.run("verify:verify", {
-	  address: raffleFactory.target,
-	  constructorArguments: [],
-	});
+	// // Verify contract on Taiko if needed (requires API keys)
+	// await hre.run("verify:verify", {
+	//   address: raffleFactory.target,
+	//   constructorArguments: [],
+	// });
 
 	console.log("RaffleFactory deployed and initialized on Taiko testnet!");
 }

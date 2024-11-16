@@ -11,6 +11,7 @@ library RaffleLib {
         address payable managementWallet;
         uint256 minTickets;
         uint256 maxTicketsPerUser;
+        address tokenAddress;
     }
 
     struct DrawStatus {

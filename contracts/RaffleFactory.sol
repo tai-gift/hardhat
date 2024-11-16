@@ -7,9 +7,12 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-// Factory Contract (Upgradeable)
 contract RaffleFactory is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    using SafeERC20 for IERC20;
+
     mapping(uint256 => address) public draws;
     mapping(address => bool) public isValidDraw;
     uint256 public drawCount;
@@ -107,24 +110,24 @@ contract RaffleFactory is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUp
         return Raffle(payable(drawAddress)).getStatus();
     }
 
-    function fundDrawShortfall(uint256 drawId) external payable onlyOwner {
+    function fundDrawShortfall(uint256 drawId, uint256 shortfallAmount) external onlyOwner {
         address drawAddress = draws[drawId];
         require(drawAddress != address(0), "Draw doesn't exist");
 
         Raffle draw = Raffle(payable(drawAddress));
-
         RaffleLib.DrawConfig memory config = draw.getConfig();
         RaffleLib.DrawStatus memory status = draw.getStatus();
+        IERC20 token = IERC20(config.tokenAddress);
 
         require(block.timestamp >= draw.getEndTime(), "Draw still ongoing");
         require(!status.isComplete, "Draw already complete");
         require(config.guaranteedPrize > status.currentPrizePool, "No shortfall");
-        require(config.guaranteedPrize > address(draw).balance, "Shortfall not needed");
 
-        // calculate draw shortfall
         uint256 shortfall = config.guaranteedPrize - status.currentPrizePool;
-        (bool success,) = payable(drawAddress).call{value: shortfall}("");
-        require(success, "Failed to transfer shortfall");
+        require(shortfallAmount == shortfall, "Invalid shortfall amount");
+
+        // Transfer tokens from factory to draw contract
+        token.safeTransfer(drawAddress, shortfall);
 
         emit FundedShortfall(drawId, drawAddress, shortfall);
     }
@@ -135,9 +138,6 @@ contract RaffleFactory is UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUp
 
         emit TicketPurchased(msg.sender,  buyer, numberOfTickets, amount);
     }
-
-    // To handle receiving Ether, use a receive function
-    receive() external payable {}
 
     // Override the _authorizeUpgrade function to restrict upgrades to the owner
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}

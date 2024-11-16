@@ -18,8 +18,7 @@ const config: HardhatUserConfig = {
   },
   networks: {
     taiko: {
-      url: "https://rpc.test.taiko.xyz", // Replace with Taiko's RPC URL
-      chainId: 167, // Replace with the actual Taiko testnet chain ID
+      url: "https://rpc.hekla.taiko.xyz", // Replace with Taiko's RPC URL
       accounts: [process.env.PRIVATE_KEY!] // Replace with your wallet's private key
     }
   }

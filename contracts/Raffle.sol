@@ -3,11 +3,14 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./RaffleFactory.sol";
 import "./RaffleLib.sol";
 
-// Individual Draw Contract
 contract Raffle is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
     uint256 private constant WINNERS_COUNT = 10;
     uint256 private constant WINNER_POOL_PERCENTAGE = 40;
     uint256 private constant CHARITY_PERCENTAGE = 50;
@@ -18,10 +21,11 @@ contract Raffle is ReentrancyGuard, Ownable {
     address public factory;
     RaffleLib.DrawConfig public config;
     RaffleLib.DrawStatus public status;
+    IERC20 public token;
 
     mapping(address => uint256) public tickets;
     mapping(address => bool) public hasClaimed;
-    mapping(address => bool) internal selectedWinners;
+    mapping(address => bool) private winnerSelection; // Renamed from selectedWinners
 
     address[] public participants;
     address[] public winners;
@@ -32,6 +36,7 @@ contract Raffle is ReentrancyGuard, Ownable {
 
     event TicketsPurchased(address indexed buyer, uint256 tickets, uint256 amount);
     event PrizeClaimed(address indexed winner, uint256 amount);
+    event DrawCompleted(address[] winners, address[] almostWinners, uint256[] prizes);
 
     modifier onlyFactory() {
         require(msg.sender == factory, "Only factory can call this function");
@@ -44,10 +49,10 @@ contract Raffle is ReentrancyGuard, Ownable {
         _;
     }
 
-
     constructor(address _factory, RaffleLib.DrawConfig memory _config) Ownable(msg.sender) ReentrancyGuard() {
         factory = _factory;
         config = _config;
+        token = IERC20(_config.tokenAddress);
     }
 
     function startDraw() external onlyFactory {
@@ -56,11 +61,15 @@ contract Raffle is ReentrancyGuard, Ownable {
         status.isActive = true;
     }
 
-    function buyTickets() external payable nonReentrant onlyDuring {
-        uint256 numOfTickets = msg.value / config.ticketPrice;
+    function buyTickets(uint256 numOfTickets) external nonReentrant onlyDuring {
         require(numOfTickets > 0, "Invalid ticket amount");
         require(numOfTickets < 10, "Max 10 tickets per transaction");
         require(tickets[msg.sender] + numOfTickets <= config.maxTicketsPerUser, "Ticket limit exceeded");
+
+        uint256 totalCost = numOfTickets * config.ticketPrice;
+
+        // Transfer tokens from user to contract
+        token.safeTransferFrom(msg.sender, address(this), totalCost);
 
         for (uint256 i = 0; i < numOfTickets; i++) {
             participants.push(msg.sender);
@@ -68,22 +77,19 @@ contract Raffle is ReentrancyGuard, Ownable {
 
         tickets[msg.sender] += numOfTickets;
         status.totalTickets += numOfTickets;
-        status.currentPrizePool += msg.value;
+        status.currentPrizePool += totalCost;
 
-        RaffleFactory(payable(factory)).notifyTicketPurchase(msg.sender, numOfTickets, msg.value);
+        RaffleFactory(payable(factory)).notifyTicketPurchase(msg.sender, numOfTickets, totalCost);
 
-        emit TicketsPurchased(msg.sender, numOfTickets, msg.value);
-    }
-
-    function getEndTime() external view returns (uint256) {
-        return config.endTime;
+        emit TicketsPurchased(msg.sender, numOfTickets, totalCost);
     }
 
     function completeDraw() external nonReentrant returns(RaffleLib.DrawStatus memory) {
         require(block.timestamp >= config.endTime, "Draw still ongoing");
         require(!status.isComplete, "Draw already complete");
 
-        if (config.guaranteedPrize > status.currentPrizePool && config.guaranteedPrize <= address(this).balance) {
+        if (config.guaranteedPrize > status.currentPrizePool &&
+            config.guaranteedPrize <= token.balanceOf(address(this))) {
             status.currentPrizePool = config.guaranteedPrize;
         }
 
@@ -102,20 +108,18 @@ contract Raffle is ReentrancyGuard, Ownable {
         }
 
         uint256 seed = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao)));
-        (address[] memory selectedWinners, address[] memory selectedAlmostWinners) = selectWinners(seed);
+        (address[] memory _winners, address[] memory _almostWinners) = selectWinners(seed);
 
-        // Set winners and almost winners
-        winners = selectedWinners;
-        almostWinners = selectedAlmostWinners;
+        winners = _winners;
+        almostWinners = _almostWinners;
 
-        (bool charitySuccess, ) = config.charityWallet.call{value: charityAmount}("");
-        require(charitySuccess, "Charity transfer failed");
-
-        (bool managementSuccess, ) = config.managementWallet.call{value: managementAmount}("");
-        require(managementSuccess, "Management transfer failed");
+        // Transfer tokens to charity and management wallets
+        token.safeTransfer(config.charityWallet, charityAmount);
+        token.safeTransfer(config.managementWallet, managementAmount);
 
         status.isComplete = true;
 
+        emit DrawCompleted(winners, almostWinners, prizes);
         return status;
     }
 
@@ -132,8 +136,8 @@ contract Raffle is ReentrancyGuard, Ownable {
             uint256 winnerIndex = uint256(keccak256(abi.encodePacked(seed, attempts))) % participants.length;
             address candidate = participants[winnerIndex];
 
-            if (!selectedWinners[candidate]) {
-                selectedWinners[candidate] = true;
+            if (!winnerSelection[candidate]) {
+                winnerSelection[candidate] = true;
 
                 if (winnerCount < WINNERS_COUNT) {
                     tempWinners[winnerCount] = candidate;
@@ -146,7 +150,7 @@ contract Raffle is ReentrancyGuard, Ownable {
             attempts++;
         }
 
-        // Fill any remaining slots with zero address if we couldn't find enough unique winners
+        // Fill any remaining slots with zero address
         for (uint256 i = winnerCount; i < WINNERS_COUNT; i++) {
             tempWinners[i] = address(0);
         }
@@ -172,10 +176,14 @@ contract Raffle is ReentrancyGuard, Ownable {
         require(prize > 0, "No prize available");
 
         hasClaimed[msg.sender] = true;
-        (bool success, ) = msg.sender.call{value: prize}("");
-        require(success, "Prize claim failed");
+        token.safeTransfer(msg.sender, prize);
 
         emit PrizeClaimed(msg.sender, prize);
+    }
+
+    // View functions
+    function getEndTime() external view returns (uint256) {
+        return config.endTime;
     }
 
     function getConfig() external view returns (RaffleLib.DrawConfig memory) {
@@ -197,10 +205,4 @@ contract Raffle is ReentrancyGuard, Ownable {
     function getAlmostWinners() external view returns (address[] memory) {
         return almostWinners;
     }
-
-    // To handle receiving Ether, use a receive function
-    receive() external payable {}
-
-    // Or to handle any unexpected function calls, use a fallback
-    fallback() external payable {}
 }

@@ -1,0 +1,20 @@
+{
+	"name": "tai-gift/1.0.0",
+	"version": "1",
+	"abis": {
+		"factory": {
+			"path": "./abis/factory.json"
+		}
+	},
+	"chains": [
+		"taiko-hekla-testnet"
+	],
+	"instances": [
+		{
+			"abi": "factory",
+			"address": "0x6b4cAc0DcbdBf8518E4B632f698cF6915472917c",
+			"startBlock": 975637,
+			"chain": "taiko-hekla-testnet"
+		}
+	]
+}
