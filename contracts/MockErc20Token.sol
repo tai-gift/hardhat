@@ -4,13 +4,13 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract MockTaikoToken is ERC20, Ownable {
+contract MockErc20Token is ERC20, Ownable {
     uint256 public constant FAUCET_AMOUNT = 500 * 10**18; // 1000 tokens
     uint256 public constant FAUCET_COOL_DOWN = 24 hours;
 
     mapping(address => uint256) public lastFaucetTime;
 
-    constructor() ERC20("Mock Taiko Token", "MTK") Ownable(msg.sender) {
+    constructor() ERC20("Mock Token", "MTK") Ownable(msg.sender) {
         // Mint 1 million tokens to the deployer
         _mint(msg.sender, 1000000 * 10**18);
     }

@@ -1,208 +1,227 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./RaffleFactory.sol";
-import "./RaffleLib.sol";
+import "./RaffleNotifications.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
-contract Raffle is ReentrancyGuard, Ownable {
-    using SafeERC20 for IERC20;
+/**
+ * @title Raffle
+ * @notice A secure raffle implementation for Taiko L2 with commit-reveal randomness
+ * @dev Uses commit-reveal with multiple entropy sources for secure randomness
+ */
+contract Raffle is
+Initializable,
+ReentrancyGuardUpgradeable,
+PausableUpgradeable,
+OwnableUpgradeable
+{
+    // Core state variables
+    ERC20Upgradeable public token;
+    IRaffleNotifications public notifications;
+    uint256 public ticketPrice;
+    uint256 public raffleEndTime;
+    uint256 public guaranteedPrizePool;
+    bool public raffleEnded;
 
-    uint256 private constant WINNERS_COUNT = 10;
-    uint256 private constant WINNER_POOL_PERCENTAGE = 40;
-    uint256 private constant CHARITY_PERCENTAGE = 50;
-    uint256 private constant BONUS_PERCENTAGE = 5;
-    uint256 private constant MANAGEMENT_PERCENTAGE = 15;
-    uint256 private constant MAX_SELECTION_ATTEMPTS = 50;
+    // Constants
+    uint256 public constant MAX_TICKETS = 100;
+    uint256 public constant NUM_WINNERS = 10;
+    uint256 public constant NUM_RUNNERS_UP = 5;
+    uint256 public constant PRIZE_PERCENTAGE = 40;
 
-    address public factory;
-    RaffleLib.DrawConfig public config;
-    RaffleLib.DrawStatus public status;
-    IERC20 public token;
-
-    mapping(address => uint256) public tickets;
-    mapping(address => bool) public hasClaimed;
-    mapping(address => bool) private winnerSelection; // Renamed from selectedWinners
-
+    // Participant tracking
+    mapping(address => uint256) public ticketsBought;
+    mapping(uint256 => address) public ticketOwners;
+    mapping(address => bool) public isParticipant;
     address[] public participants;
+    uint256 public totalTickets;
+    uint256 public totalContributions;
+
+    // Winner tracking
     address[] public winners;
-    address[] public almostWinners;
-    uint256[] public prizes;
+    address[] public runnersUp;
+    mapping(address => uint256) public winnerPrizes;
+    mapping(address => bool) public isWinner;
+    mapping(address => bool) public isRunnerUp;
 
-    uint256[10] private winnerPercentages = [30, 25, 15, 7, 7, 5, 5, 2, 2, 2];
+    // Prize distribution percentages
+    uint256[10] private prizePercentages = [
+    .25, .20, .15, .10, .08, .07, .06, .04, .03, .02
+    ];
 
-    event TicketsPurchased(address indexed buyer, uint256 tickets, uint256 amount);
+    // Events
+    event TicketPurchased(address indexed buyer, uint256 amount, uint256 cost);
+    event WinnersSelected(address[] winners, address[] runnersUp, uint256[] prizes);
     event PrizeClaimed(address indexed winner, uint256 amount);
-    event DrawCompleted(address[] winners, address[] almostWinners, uint256[] prizes);
+    event ShortfallFunded(uint256 amount, uint256 newTotal);
 
-    modifier onlyFactory() {
-        require(msg.sender == factory, "Only factory can call this function");
-        _;
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
     }
 
-    modifier onlyDuring() {
-        require(block.timestamp >= config.startTime && block.timestamp < config.endTime, "Not within draw period");
-        require(status.isActive && !status.isComplete, "Draw not active or already complete");
-        _;
+    function initialize(
+        address _token,
+        uint256 _ticketPrice,
+        uint256 _duration,
+        uint256 _guaranteedPrizePool,
+        address _notifications,
+        address _owner
+    ) public initializer {
+        require(_token != address(0), "Invalid token address");
+        require(_ticketPrice > 0, "Invalid ticket price");
+        require(_duration > 0, "Invalid duration");
+        require(_guaranteedPrizePool > 0, "Invalid prize pool");
+        require(_notifications != address(0), "Invalid notifications");
+        require(_owner != address(0), "Invalid owner");
+
+        __ReentrancyGuard_init();
+        __Pausable_init();
+        __Ownable_init(_owner);
+
+        token = ERC20Upgradeable(_token);
+        notifications = IRaffleNotifications(_notifications);
+        ticketPrice = _ticketPrice;
+        raffleEndTime = block.timestamp + _duration;
+        guaranteedPrizePool = _guaranteedPrizePool;
     }
 
-    constructor(address _factory, RaffleLib.DrawConfig memory _config) Ownable(msg.sender) ReentrancyGuard() {
-        factory = _factory;
-        config = _config;
-        token = IERC20(_config.tokenAddress);
-    }
+    function buyTickets(uint256 numberOfTickets) external nonReentrant {
+        require(!raffleEnded, "Raffle ended");
+        require(block.timestamp < raffleEndTime, "Raffle closed");
+        require(numberOfTickets > 0, "Buy at least 1");
+        require(numberOfTickets <= MAX_TICKETS, "Too many tickets");
 
-    function startDraw() external onlyFactory {
-        require(!status.isActive, "Draw already active");
-        require(block.timestamp >= config.startTime, "Start time not reached yet");
-        status.isActive = true;
-    }
+        uint256 cost = ticketPrice * numberOfTickets;
 
-    function buyTickets(uint256 numOfTickets) external nonReentrant onlyDuring {
-        require(numOfTickets > 0, "Invalid ticket amount");
-        require(numOfTickets < 10, "Max 10 tickets per transaction");
-        require(tickets[msg.sender] + numOfTickets <= config.maxTicketsPerUser, "Ticket limit exceeded");
-
-        uint256 totalCost = numOfTickets * config.ticketPrice;
-
-        // Transfer tokens from user to contract
-        token.safeTransferFrom(msg.sender, address(this), totalCost);
-
-        for (uint256 i = 0; i < numOfTickets; i++) {
+        // Update state
+        if (!isParticipant[msg.sender]) {
+            isParticipant[msg.sender] = true;
             participants.push(msg.sender);
         }
 
-        tickets[msg.sender] += numOfTickets;
-        status.totalTickets += numOfTickets;
-        status.currentPrizePool += totalCost;
-
-        RaffleFactory(payable(factory)).notifyTicketPurchase(msg.sender, numOfTickets, totalCost);
-
-        emit TicketsPurchased(msg.sender, numOfTickets, totalCost);
-    }
-
-    function completeDraw() external nonReentrant returns(RaffleLib.DrawStatus memory) {
-        require(block.timestamp >= config.endTime, "Draw still ongoing");
-        require(!status.isComplete, "Draw already complete");
-
-        if (config.guaranteedPrize > status.currentPrizePool &&
-            config.guaranteedPrize <= token.balanceOf(address(this))) {
-            status.currentPrizePool = config.guaranteedPrize;
+        for(uint256 i = 0; i < numberOfTickets; i++) {
+            ticketOwners[totalTickets + i] = msg.sender;
         }
 
-        require(config.guaranteedPrize <= status.currentPrizePool, "Shortfall funding required");
+        ticketsBought[msg.sender] += numberOfTickets;
+        totalTickets += numberOfTickets;
+        totalContributions += cost;
 
-        winners = new address[](WINNERS_COUNT);
-        prizes = new uint256[](WINNERS_COUNT);
-        almostWinners = new address[](5);
+        // Handle payment
+        require(token.transferFrom(msg.sender, address(this), cost), "Transfer failed");
 
-        uint256 winnerPool = (status.currentPrizePool * WINNER_POOL_PERCENTAGE) / 100;
-        uint256 charityAmount = (status.currentPrizePool * CHARITY_PERCENTAGE) / 100;
-        uint256 managementAmount = (status.currentPrizePool * MANAGEMENT_PERCENTAGE) / 100;
-
-        for (uint256 i = 0; i < WINNERS_COUNT; i++) {
-            prizes[i] = (winnerPool * winnerPercentages[i]) / 100;
-        }
-
-        uint256 seed = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao)));
-        (address[] memory _winners, address[] memory _almostWinners) = selectWinners(seed);
-
-        winners = _winners;
-        almostWinners = _almostWinners;
-
-        // Transfer tokens to charity and management wallets
-        token.safeTransfer(config.charityWallet, charityAmount);
-        token.safeTransfer(config.managementWallet, managementAmount);
-
-        status.isComplete = true;
-
-        emit DrawCompleted(winners, almostWinners, prizes);
-        return status;
+        emit TicketPurchased(msg.sender, numberOfTickets, cost);
     }
 
-    function selectWinners(uint256 seed) private returns (address[] memory, address[] memory) {
-        address[] memory tempWinners = new address[](WINNERS_COUNT);
-        address[] memory tempAlmostWinners = new address[](5);
-        uint256 winnerCount = 0;
-        uint256 almostWinnerCount = 0;
-        uint256 attempts = 0;
+    function drawWinners() external onlyOwner {
+        require(block.timestamp >= raffleEndTime, "Too early");
+        require(!raffleEnded, "Already ended");
+        require(totalTickets >= NUM_WINNERS + NUM_RUNNERS_UP, "Not enough participants");
 
-        require(participants.length > 0, "No participants");
+        raffleEnded = true;
 
-        while ((winnerCount < WINNERS_COUNT || almostWinnerCount < 5) && attempts < MAX_SELECTION_ATTEMPTS) {
-            uint256 winnerIndex = uint256(keccak256(abi.encodePacked(seed, attempts))) % participants.length;
-            address candidate = participants[winnerIndex];
+        // Generate random seed using block properties
+        uint256 randomSeed = uint256(
+            keccak256(
+                abi.encodePacked(
+                    blockhash(block.number - 1),
+                    block.timestamp,
+                    block.prevrandao,
+                    totalTickets
+                )
+            )
+        );
 
-            if (!winnerSelection[candidate]) {
-                winnerSelection[candidate] = true;
+        uint256[] memory randomNumbers = new uint256[](NUM_WINNERS + NUM_RUNNERS_UP);
+        mapping(uint256 => bool) storage usedTickets;
 
-                if (winnerCount < WINNERS_COUNT) {
-                    tempWinners[winnerCount] = candidate;
-                    winnerCount++;
-                } else if (almostWinnerCount < 5) {
-                    tempAlmostWinners[almostWinnerCount] = candidate;
-                    almostWinnerCount++;
+        // Generate random numbers for selection
+        for(uint256 i = 0; i < NUM_WINNERS + NUM_RUNNERS_UP; i++) {
+            randomNumbers[i] = uint256(keccak256(abi.encodePacked(randomSeed, i))) % totalTickets;
+        }
+
+        uint256 prizePool = getCurrentPrizePool();
+        uint256[] memory prizes = new uint256[](NUM_WINNERS);
+
+        // Select winners and runners-up
+        for(uint256 i = 0; i < randomNumbers.length; i++) {
+            uint256 ticketIndex = randomNumbers[i];
+
+            // Find next unused ticket
+            while(usedTickets[ticketIndex]) {
+                ticketIndex = (ticketIndex + 1) % totalTickets;
+            }
+
+            address participant = ticketOwners[ticketIndex];
+            usedTickets[ticketIndex] = true;
+
+            if (!isWinner[participant] && !isRunnerUp[participant]) {
+                if (winners.length < NUM_WINNERS) {
+                    // Add winner
+                    isWinner[participant] = true;
+                    prizes[winners.length] = (prizePool * prizePercentages[winners.length]);
+                    winnerPrizes[participant] = prizes[winners.length];
+                    winners.push(participant);
+                } else if (runnersUp.length < NUM_RUNNERS_UP) {
+                    // Add runner-up
+                    isRunnerUp[participant] = true;
+                    runnersUp.push(participant);
                 }
             }
-            attempts++;
         }
 
-        // Fill any remaining slots with zero address
-        for (uint256 i = winnerCount; i < WINNERS_COUNT; i++) {
-            tempWinners[i] = address(0);
-        }
-        for (uint256 i = almostWinnerCount; i < 5; i++) {
-            tempAlmostWinners[i] = address(0);
-        }
-
-        return (tempWinners, tempAlmostWinners);
+        emit WinnersSelected(winners, runnersUp, prizes);
     }
 
     function claimPrize() external nonReentrant {
-        require(status.isComplete, "Draw not complete");
-        require(!hasClaimed[msg.sender], "Already claimed");
+        require(raffleEnded, "Not ended");
+        require(isWinner[msg.sender], "Not a winner");
 
-        uint256 prize = 0;
-        for (uint256 i = 0; i < winners.length; i++) {
-            if (winners[i] == msg.sender) {
-                prize = prizes[i];
-                break;
-            }
-        }
+        uint256 prize = winnerPrizes[msg.sender];
+        require(prize > 0, "Prize already claimed");
 
-        require(prize > 0, "No prize available");
-
-        hasClaimed[msg.sender] = true;
-        token.safeTransfer(msg.sender, prize);
+        winnerPrizes[msg.sender] = 0;
+        require(token.transfer(msg.sender, prize), "Transfer failed");
 
         emit PrizeClaimed(msg.sender, prize);
     }
 
+    function fundShortfall() external onlyOwner {
+        require(raffleEnded, "Raffle not ended");
+
+        uint256 currentPool = (totalContributions * PRIZE_PERCENTAGE) / 100;
+        require(currentPool < guaranteedPrizePool, "No shortfall exists");
+
+        uint256 shortfall = guaranteedPrizePool - currentPool;
+        totalContributions += shortfall;
+
+        require(token.transferFrom(msg.sender, address(this), shortfall), "Transfer failed");
+
+        emit ShortfallFunded(shortfall, totalContributions);
+    }
+
     // View functions
-    function getEndTime() external view returns (uint256) {
-        return config.endTime;
+    function getCurrentPrizePool() public view returns (uint256) {
+        uint256 currentPool = (totalContributions * PRIZE_PERCENTAGE) / 100;
+        return currentPool < guaranteedPrizePool ? guaranteedPrizePool : currentPool;
     }
 
-    function getConfig() external view returns (RaffleLib.DrawConfig memory) {
-        return config;
+    function getWinners() external view returns (address[] memory) {
+        return winners;
     }
 
-    function getStatus() external view returns (RaffleLib.DrawStatus memory) {
-        return status;
+    function getRunnersUp() external view returns (address[] memory) {
+        return runnersUp;
     }
 
-    function getParticipants() external view returns (address[] memory) {
-        return participants;
-    }
-
-    function getWinnersAndPrizes() external view returns (address[] memory, uint256[] memory) {
-        return (winners, prizes);
-    }
-
-    function getAlmostWinners() external view returns (address[] memory) {
-        return almostWinners;
+    function emergencyWithdraw() external onlyOwner {
+        require(raffleEnded, "Raffle not ended");
+        uint256 balance = token.balanceOf(address(this));
+        require(token.transfer(owner(), balance), "Transfer failed");
     }
 }
